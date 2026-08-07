@@ -23,10 +23,12 @@ serve(async (req) => {
       company, city, projectType, helpType, message
     } = await req.json();
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    // SUPABASE_URL may be an internal Docker host (kong:8000); keep it for API calls
+    // but use SUPABASE_PUBLIC_URL for any URLs that leave the server (e.g. email links)
+    const internalUrl = Deno.env.get("SUPABASE_URL")!;
+    const publicUrl = Deno.env.get("SUPABASE_PUBLIC_URL") || internalUrl;
+
+    const supabase = createClient(internalUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
     // Upload PDF to Storage (if provided)
     let pdfLinkHtml = `<p style="color:#6b7280;font-size:14px;">No PDF attached — form submitted without completing scoring tool.</p>`;
@@ -44,8 +46,13 @@ serve(async (req) => {
         .createSignedUrl(fileName, 60 * 60 * 24 * 7);
 
       if (signed?.signedUrl) {
+        // Replace the internal origin with the publicly reachable one
+        const signedUrl = signed.signedUrl.replace(
+          new URL(internalUrl).origin,
+          new URL(publicUrl).origin
+        );
         pdfLinkHtml = `
-          <a href="${signed.signedUrl}" style="display:inline-block;background:${GENSLER_RED};color:white;padding:12px 24px;text-decoration:none;border-radius:4px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;">
+          <a href="${signedUrl}" style="display:inline-block;background:${GENSLER_RED};color:white;padding:12px 24px;text-decoration:none;border-radius:4px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;">
             Download Feasibility Report PDF
           </a>
           <p style="color:#999;font-size:12px;margin-top:8px;font-family:Arial,sans-serif;">Link expires in 7 days.</p>`;
