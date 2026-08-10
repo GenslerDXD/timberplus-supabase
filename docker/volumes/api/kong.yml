@@ -350,24 +350,6 @@ services:
         strip_path: true
         paths:
           - /functions/v1/
-    plugins:
-      - name: cors
-        config:
-          origins:
-            - https://timberplus.gensler.com
-          methods:
-            - GET
-            - POST
-            - PUT
-            - PATCH
-            - DELETE
-            - OPTIONS
-          headers:
-            - Authorization
-            - Content-Type
-            - apikey
-            - x-client-info
-          max_age: 3600
 
   ## OAuth 2.0 Authorization Server Metadata (RFC 8414)
   - name: well-known-oauth
