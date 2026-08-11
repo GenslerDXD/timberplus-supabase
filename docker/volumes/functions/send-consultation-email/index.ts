@@ -1,7 +1,10 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY")!;
+const AZURE_ECS_ENDPOINT = Deno.env.get("AZURE_ECS_ENDPOINT")!;
+const AZURE_ECS_ACCESS_KEY = Deno.env.get("AZURE_ECS_ACCESS_KEY")!;
+const AZURE_ECS_SENDER_EMAIL = Deno.env.get("AZURE_ECS_SENDER_EMAIL")!;
+const AZURE_ECS_API_VERSION = Deno.env.get("AZURE_ECS_API_VERSION") || "2025-09-01";
 const YOUR_EMAIL = Deno.env.get("NOTIFY_EMAIL")!;
 
 // Gensler brand
@@ -12,6 +15,99 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "https://timberplus.gensler.com",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const toBase64 = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+};
+
+const fromBase64 = (value: string): Uint8Array =>
+  Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+
+const sha256Base64 = async (text: string): Promise<string> => {
+  const bytes = new TextEncoder().encode(text);
+  const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const hash = await crypto.subtle.digest("SHA-256", data as unknown as BufferSource);
+  return toBase64(new Uint8Array(hash));
+};
+
+const hmacSha256Base64 = async (text: string, base64Secret: string): Promise<string> => {
+  const secretBytes = fromBase64(base64Secret);
+  const rawSecret = secretBytes.buffer.slice(
+    secretBytes.byteOffset,
+    secretBytes.byteOffset + secretBytes.byteLength
+  );
+  const key = await crypto.subtle.importKey(
+    "raw",
+    rawSecret as unknown as BufferSource,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const bodyBytes = new TextEncoder().encode(text);
+  const bodyData = bodyBytes.buffer.slice(bodyBytes.byteOffset, bodyBytes.byteOffset + bodyBytes.byteLength);
+  const signature = await crypto.subtle.sign("HMAC", key, bodyData as unknown as BufferSource);
+  return toBase64(new Uint8Array(signature));
+};
+
+const sendEmailWithAzureEcs = async ({
+  to,
+  replyTo,
+  subject,
+  html,
+}: {
+  to: string[];
+  replyTo?: string;
+  subject: string;
+  html: string;
+}) => {
+  const endpoint = new URL(
+    `/emails:send?api-version=${AZURE_ECS_API_VERSION}`,
+    AZURE_ECS_ENDPOINT
+  );
+
+  const payload: Record<string, unknown> = {
+    senderAddress: AZURE_ECS_SENDER_EMAIL,
+    content: { subject, html },
+    recipients: {
+      to: to.map((address) => ({ address })),
+    },
+  };
+
+  if (replyTo) {
+    payload.replyTo = [{ address: replyTo }];
+  }
+
+  const requestBody = JSON.stringify(payload);
+  const method = "POST";
+  const date = new Date().toUTCString();
+  const contentHash = await sha256Base64(requestBody);
+  const host = endpoint.host;
+  const pathAndQuery = `${endpoint.pathname}${endpoint.search}`;
+  const stringToSign = `${method}\n${pathAndQuery}\n${date};${host};${contentHash}`;
+  const signature = await hmacSha256Base64(stringToSign, AZURE_ECS_ACCESS_KEY);
+  const authorization = `HMAC-SHA256 SignedHeaders=x-ms-date;host;x-ms-content-sha256&Signature=${signature}`;
+
+  const response = await fetch(endpoint.toString(), {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-ms-date": date,
+      "x-ms-content-sha256": contentHash,
+      "Authorization": authorization,
+    },
+    body: requestBody,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Azure ECS email send failed (${response.status}): ${errorText}`);
+  }
+
+  return response;
 };
 
 serve(async (req) => {
@@ -77,18 +173,11 @@ serve(async (req) => {
       </div>`;
 
     // ── EMAIL 1: Notify YOU with full contact form details + PDF ──────────
-    const notifyRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: "Timber+ <onboarding@resend.dev>",
-        to: [YOUR_EMAIL],
-        reply_to: submitterEmail,
-        subject: `Timber+ Consultation — ${submitterName} · ${projectLocation || city} · ${score}%`,
-        html: `
+    const notifyRes = await sendEmailWithAzureEcs({
+      to: [YOUR_EMAIL],
+      replyTo: submitterEmail,
+      subject: `Timber+ Consultation — ${submitterName} · ${projectLocation || city} · ${score}%`,
+      html: `
           <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;color:#171717;">
             <div style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden;">
               ${emailHeader('Timber+ &middot; New Consultation Request')}
@@ -125,27 +214,19 @@ serve(async (req) => {
             </p>
           </div>
         `,
-      }),
     });
 
     if (!notifyRes.ok) {
       const errText = await notifyRes.text();
-      throw new Error("Resend error (notify): " + errText);
+      throw new Error("Azure ECS error (notify): " + errText);
     }
 
     // ── EMAIL 2: Thank-you to the submitter ───────────────────────────────
-    const thankYouRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: "Gensler Timber+ <onboarding@resend.dev>",
-        to: [submitterEmail],
-        reply_to: YOUR_EMAIL,
-        subject: "Thank you for contacting Gensler — Timber+ Consultation",
-        html: `
+    const thankYouRes = await sendEmailWithAzureEcs({
+      to: [submitterEmail],
+      replyTo: YOUR_EMAIL,
+      subject: "Thank you for contacting Gensler — Timber+ Consultation",
+      html: `
           <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#171717;">
             <div style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden;">
               ${emailHeader('Timber+ Consultation')}
@@ -167,7 +248,6 @@ serve(async (req) => {
             </p>
           </div>
         `,
-      }),
     });
 
     if (!thankYouRes.ok) {
